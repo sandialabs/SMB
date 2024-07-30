@@ -33,8 +33,8 @@ const int magic_tag = 1;
 int npeers = 6;
 int niters = 4096;
 int nmsgs = 128;
-int nbytes = 8;
-int cache_size = (8 * 1024 * 1024 / sizeof(int));
+size_t nbytes = 8;
+size_t cache_size = (8 * 1024 * 1024 / sizeof(int));
 int ppn = -1;
 int machine_output = 0;
 
@@ -389,6 +389,8 @@ main(int argc, char *argv[])
         }
     }
 
+    size_t buffer_size = npeers * nmsgs * nbytes;
+
     /* allocate buffers */
     send_peers = malloc(sizeof(int) * npeers);
     if (NULL == send_peers) abort_app("malloc");
@@ -396,9 +398,9 @@ main(int argc, char *argv[])
     if (NULL == recv_peers) abort_app("malloc");
     cache_buf = malloc(sizeof(int) * cache_size);
     if (NULL == cache_buf) abort_app("malloc");
-    send_buf = malloc(npeers * nmsgs * nbytes);
+    send_buf = malloc(buffer_size);
     if (NULL == send_buf) abort_app("malloc");
-    recv_buf = malloc(npeers * nmsgs * nbytes);
+    recv_buf = malloc(buffer_size);
     if (NULL == recv_buf) abort_app("malloc");
     reqs = malloc(sizeof(MPI_Request) * 2 * nmsgs * npeers);
     if (NULL == reqs) abort_app("malloc");
