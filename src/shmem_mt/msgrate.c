@@ -517,7 +517,12 @@ main(int argc, char *argv[])
     }
 
     /* initialize SHMEM */
-    shmem_init_thread(SHMEM_THREAD_MULTIPLE);
+    int provided;
+    shmem_init_thread(SHMEM_THREAD_MULTIPLE, &provided);
+    if(SHMEM_THREAD_MULTIPLE != provided) {
+        printf("Error: Current SHMEM implementation doesn't support multithreading\n");
+        exit(-1);
+    }
     nprocs = shmem_n_pes();
     world_size=shmem_n_pes();
     int me = shmem_my_pe();
