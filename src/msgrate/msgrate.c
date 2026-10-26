@@ -21,6 +21,7 @@
  */
 
 #include <mpi.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,12 +30,21 @@
 /**
  * If we're using a GPU aware varient.
  */
+#if defined(ENABLE_CUDA) && defined(ENABLE_HIP)
+#error "Define only one of ENABLE_CUDA or ENABLE_HIP"
+#endif
+
 #ifdef ENABLE_CUDA
 #include <cuda_runtime.h>
 #endif
 
 #ifdef ENABLE_HIP
-#include <hip/hip_runtime.h>
+/* Runtime-API-only header: msgrate is plain C compiled by mpicc and uses no
+ * kernels.  Requires __HIP_PLATFORM_AMD__ (set by the Makefile for HIP=1).
+ * Previous include, known to work on an AMD system -- restore if needed:
+ * #include <hip/hip_runtime.h>
+ */
+#include <hip/hip_runtime_api.h>
 #endif
 
 static void
@@ -49,19 +59,35 @@ abort_app(const char *msg)
  */
 static void* bench_alloc(size_t size);
 static void  bench_free(void* ptr);
-static void  bench_memset(void* ptr, int value, size_t size);
-static int   bench_gpu_init(void);
+#if defined(ENABLE_CUDA) || defined(ENABLE_HIP)
+static int   bench_gpu_init(void);   /* only called in GPU builds */
+#endif
 static void  bench_cleanup(void);
 static void bench_memcpy_to_host(void* dst, const void* src, size_t size);
 static void bench_memcpy_from_host(void* dst, const void* src, size_t size);
 static void bench_sync(void);
+
+#if defined(ENABLE_CUDA) || defined(ENABLE_HIP)
+/* Fatal GPU error: abort the whole job once MPI is up so peers don't hang;
+ * plain exit() before MPI_Init (bench_gpu_init runs first). */
+static void gpu_fatal(void)
+{
+    int initialized = 0, finalized = 0;
+    MPI_Initialized(&initialized);
+    MPI_Finalized(&finalized);
+    if (initialized && !finalized) {
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    exit(1);
+}
+#endif
 
 #ifdef ENABLE_CUDA
 static void check_cuda(cudaError_t rc, const char* msg)
 {
     if (rc != cudaSuccess) {
         fprintf(stderr, "%s failed: %s\n", msg, cudaGetErrorString(rc));
-        exit(1);
+        gpu_fatal();
     }
 }
 #endif
@@ -71,10 +97,17 @@ static void check_hip(hipError_t rc, const char* msg)
 {
     if (rc != hipSuccess) {
         fprintf(stderr, "%s failed: %s\n", msg, hipGetErrorString(rc));
-        exit(1);
+        gpu_fatal();
     }
 }
 #endif
+
+#if defined(ENABLE_CUDA) || defined(ENABLE_HIP)
+/* Device selected by bench_gpu_init() and visible device count. */
+static int bench_gpu_dev = -1;
+static int bench_gpu_dev_count = 0;
+/* LOCAL_RANK value bench_gpu_init() used; -1 if LOCAL_RANK was unset. */
+static int bench_gpu_local_rank = -1;
 
 static int bench_gpu_init(void)
 {
@@ -90,10 +123,13 @@ static int bench_gpu_init(void)
     }
 
     if (s != NULL) {
-        dev = atoi(s) % dev_count;
+        bench_gpu_local_rank = atoi(s);
+        dev = bench_gpu_local_rank % dev_count;
     }
 
     check_cuda(cudaSetDevice(dev), "cudaSetDevice");
+    bench_gpu_dev = dev;
+    bench_gpu_dev_count = dev_count;
     return 0;
 
 #elif defined(ENABLE_HIP)
@@ -108,16 +144,17 @@ static int bench_gpu_init(void)
     }
 
     if (s != NULL) {
-        dev = atoi(s) % dev_count;
+        bench_gpu_local_rank = atoi(s);
+        dev = bench_gpu_local_rank % dev_count;
     }
 
     check_hip(hipSetDevice(dev), "hipSetDevice");
-    return 0;
-
-#else
+    bench_gpu_dev = dev;
+    bench_gpu_dev_count = dev_count;
     return 0;
 #endif
 }
+#endif /* ENABLE_CUDA || ENABLE_HIP */
 
 static void* bench_alloc(size_t size)
 {
@@ -131,11 +168,11 @@ static void* bench_alloc(size_t size)
     check_hip(hipMemset(p, 0, size), "hipMemset");
 #else
     p = malloc(size);
-    if (p == NULL) {
+    if (p == NULL && size > 0) {
         perror("malloc");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    memset(p, 0, size);
+    if (p != NULL) memset(p, 0, size);
 #endif
 
     return p;
@@ -195,25 +232,40 @@ static void bench_memcpy_from_host(void* dst, const void* src, size_t size)
 }
 
 /** Verification helper functions */
-static unsigned char pattern_byte(int src_rank, int msg_idx, size_t byte_idx)
+/*
+ * Byte pattern for byte b of message k sent from src_rank to dst_rank.
+ * Extends the report's P(r,k,b) = ((r*131 + k)*131 + b) mod 256 with the
+ * destination rank, so a sender that puts peer A's data in peer B's slot
+ * is detected.  Wider 32-bit mixing (then folded to 8 bits) also keeps
+ * ranks 256 apart from producing identical patterns.
+ */
+static unsigned char pattern_byte(int src_rank, int dst_rank, int msg_idx, size_t byte_idx)
 {
     unsigned int x = (unsigned int) src_rank;
+    x = x * 131u + (unsigned int) dst_rank;
     x = x * 131u + (unsigned int) msg_idx;
     x = x * 131u + (unsigned int) byte_idx;
+    x ^= x >> 16;
+    x ^= x >> 8;
     return (unsigned char) (x & 0xffu);
 }
 
-static void init_send_buffer(char* buf, int rank, int npeers, int nmsgs, size_t nbytes)
+/* Multi-peer send layout: slot j goes to dests[npeers - 1 - j]. */
+static void init_send_buffer(char* buf, int rank, const int* dests, int npeers, int nmsgs, size_t nbytes)
 {
     size_t total = (size_t) npeers * (size_t) nmsgs * nbytes;
-    unsigned char* host = (unsigned char*) malloc(total);
+    unsigned char* host;
+
+    if (total == 0) return;
+    host = (unsigned char*) malloc(total);
     if (host == NULL) abort_app("malloc");
 
     for (int j = 0; j < npeers; ++j) {
+        int dst = dests[npeers - 1 - j];
         for (int k = 0; k < nmsgs; ++k) {
             size_t base = ((size_t) j * (size_t) nmsgs + (size_t) k) * nbytes;
             for (size_t b = 0; b < nbytes; ++b) {
-                host[base + b] = pattern_byte(rank, k, b);
+                host[base + b] = pattern_byte(rank, dst, k, b);
             }
         }
     }
@@ -223,25 +275,83 @@ static void init_send_buffer(char* buf, int rank, int npeers, int nmsgs, size_t 
     free(host);
 }
 
-static void verify_recv_buffer(char* buf, int rank, int* recv_peers, int npeers, int nmsgs, size_t nbytes)
+/*
+ * Single-direction send layout: messages k at slot-0 offsets, all to dst.
+ * Overwrites only slot 0 of the multi-peer layout, so callers must
+ * re-run init_send_buffer() before the multi-peer tests.
+ */
+static void init_send_buffer_one_way(char* buf, int rank, int dst, int nmsgs, size_t nbytes)
 {
-    size_t total = (size_t) npeers * (size_t) nmsgs * nbytes;
-    unsigned char* host = (unsigned char*) malloc(total);
+    size_t total = (size_t) nmsgs * nbytes;
+    unsigned char* host;
+
+    if (total == 0) return;
+    host = (unsigned char*) malloc(total);
+    if (host == NULL) abort_app("malloc");
+
+    for (int k = 0; k < nmsgs; ++k) {
+        for (size_t b = 0; b < nbytes; ++b) {
+            host[(size_t) k * nbytes + b] = pattern_byte(rank, dst, k, b);
+        }
+    }
+
+    bench_memcpy_from_host(buf, host, total);
+    bench_sync();
+    free(host);
+}
+
+/*
+ * Fill the recv region expected to hold data from srcs[0..nslots-1] with
+ * the bitwise complement of the expected pattern, so any byte the test
+ * fails to deliver cannot pass verification by accident.
+ */
+static void poison_recv_buffer(char* buf, int rank, const int* srcs, int nslots, int nmsgs, size_t nbytes)
+{
+    size_t total = (size_t) nslots * (size_t) nmsgs * nbytes;
+    unsigned char* host;
+
+    if (total == 0) return;
+    host = (unsigned char*) malloc(total);
+    if (host == NULL) abort_app("malloc");
+
+    for (int j = 0; j < nslots; ++j) {
+        for (int k = 0; k < nmsgs; ++k) {
+            size_t base = ((size_t) j * (size_t) nmsgs + (size_t) k) * nbytes;
+            for (size_t b = 0; b < nbytes; ++b) {
+                host[base + b] = (unsigned char) ~pattern_byte(srcs[j], rank, k, b);
+            }
+        }
+    }
+
+    bench_memcpy_from_host(buf, host, total);
+    bench_sync();
+    free(host);
+}
+
+/* Check recv slots 0..nslots-1: slot j must hold messages from srcs[j]. */
+static void verify_recv_buffer(const char* test, char* buf, int rank, const int* srcs,
+                               int nslots, int nmsgs, size_t nbytes)
+{
+    size_t total = (size_t) nslots * (size_t) nmsgs * nbytes;
+    unsigned char* host;
+
+    if (total == 0) return;
+    host = (unsigned char*) malloc(total);
     if (host == NULL) abort_app("malloc");
 
     bench_memcpy_to_host(host, buf, total);
     bench_sync();
 
-    for (int j = 0; j < npeers; ++j) {
-        int src_rank = recv_peers[j];
+    for (int j = 0; j < nslots; ++j) {
+        int src_rank = srcs[j];
         for (int k = 0; k < nmsgs; ++k) {
             size_t base = ((size_t) j * (size_t) nmsgs + (size_t) k) * nbytes;
             for (size_t b = 0; b < nbytes; ++b) {
-                unsigned char expected = pattern_byte(src_rank, k, b);
+                unsigned char expected = pattern_byte(src_rank, rank, k, b);
                 if (host[base + b] != expected) {
                     fprintf(stderr,
-                            "Verification failed on rank %d at recv_slot=%d msg=%d byte=%zu: got=%u expected=%u src=%d\n",
-                            rank, j, k, b,
+                            "Verification failed (%s) on rank %d at recv_slot=%d msg=%d byte=%zu: got=%u expected=%u src=%d\n",
+                            test, rank, j, k, b,
                             (unsigned int) host[base + b],
                             (unsigned int) expected,
                             src_rank);
@@ -267,6 +377,7 @@ size_t cache_size = (8 * 1024 * 1024 / sizeof(int));
 int ppn = -1;
 int machine_output = 0;
 int verify = 0;
+int debug = 0;
 /* globals */
 int *send_peers;
 int *recv_peers;
@@ -281,15 +392,14 @@ int world_size = -1;
 static void
 cache_invalidate(void)
 {
-#if defined(ENABLE_CUDA) || defined(ENABLE_HIP)
-    return;
-#else
+    /* Runs in all builds: flushes MPI's host-side state even when the
+     * communication buffers are device-resident. -c 0 disables it. */
     int i;
+    if (cache_size == 0) return;
     cache_buf[0] = 1;
     for (i = 1 ; i < cache_size ; ++i) {
         cache_buf[i] = cache_buf[i - 1];
     }
-#endif
 }
 
 
@@ -518,6 +628,7 @@ usage(void)
     fprintf(stderr, "  -n <ppn>     Number of procs per node\n");
     fprintf(stderr, "  -o           Format output to be machine readable\n");
     fprintf(stderr, "  -v           Verify message contents\n");
+    fprintf(stderr, "  --debug      GPU builds: print per-rank host/device mapping\n");
     fprintf(stderr, "\nReport bugs to <mdosanj@sandia.gov>\n");
 }
 
@@ -542,8 +653,13 @@ main(int argc, char *argv[])
     /* root handles arguments and bcasts answers */
     if (0 == rank) {
         int ch;
-        while (start_err != 1 && 
-               (ch = getopt(argc, argv, "p:i:m:s:c:n:ovh")) != -1) {
+        static const struct option long_opts[] = {
+            { "debug", no_argument, NULL, 'D' },
+            { NULL, 0, NULL, 0 }
+        };
+        while (start_err != 1 &&
+               (ch = getopt_long(argc, argv, "p:i:m:s:c:n:ovh",
+                                 long_opts, NULL)) != -1) {
             switch (ch) {
             case 'p':
                 npeers = atoi(optarg);
@@ -568,6 +684,9 @@ main(int argc, char *argv[])
                 break;
             case 'v':
                 verify = 1;
+                break;
+            case 'D':
+                debug = 1;
                 break;
             case 'h':
             case '?':
@@ -605,32 +724,83 @@ main(int argc, char *argv[])
     MPI_Bcast(&npeers, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&niters, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&nmsgs, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&nbytes, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&cache_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    /* size_t globals: broadcast their full width, not as 4-byte MPI_INT */
+    MPI_Bcast(&nbytes, sizeof(nbytes), MPI_BYTE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&cache_size, sizeof(cache_size), MPI_BYTE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&ppn, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&verify, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&debug, 1, MPI_INT, 0, MPI_COMM_WORLD);
     if (0 == rank) {
         if (!machine_output) {
             printf("job size:   %d\n", world_size);
             printf("npeers:     %d\n", npeers);
             printf("niters:     %d\n", niters);
             printf("nmsgs:      %d\n", nmsgs);
-            printf("nbytes:     %d\n", nbytes);
-            printf("cache size: %d\n", cache_size * (int)sizeof(int));
+            printf("nbytes:     %zu\n", nbytes);
+            printf("cache size: %zu\n", cache_size * sizeof(int));
             printf("ppn:        %d\n", ppn);
 #if defined(ENABLE_CUDA)
-            printf("CUDA\n");
+            printf("backend:    CUDA\n");
+            printf("gpu device: %d of %d (rank 0, LOCAL_RANK mod devices)\n",
+                   bench_gpu_dev, bench_gpu_dev_count);
 #elif defined(ENABLE_HIP)
-            printf("HIP\n");
+            printf("backend:    HIP\n");
+            printf("gpu device: %d of %d (rank 0, LOCAL_RANK mod devices)\n",
+                   bench_gpu_dev, bench_gpu_dev_count);
 #endif
         } else {
-            printf("%d %d %d %d %d %d %d ", 
+            printf("%d %d %d %d %zu %zu %d ",
                    world_size, npeers, niters, nmsgs, nbytes,
-                   cache_size * (int)sizeof(int), ppn);
+                   cache_size * sizeof(int), ppn);
         }
     }
 
-    size_t buffer_size = npeers * nmsgs * nbytes;
+#if defined(ENABLE_CUDA) || defined(ENABLE_HIP)
+    /* --debug: per-rank host / LOCAL_RANK / device map (collective on all ranks). */
+    if (debug && !machine_output) {
+        enum { HOSTLEN = 64 };
+        char host[HOSTLEN];
+        int info[3] = { bench_gpu_local_rank, bench_gpu_dev, bench_gpu_dev_count };
+        char *all_hosts = NULL;
+        int *all_info = NULL;
+
+        memset(host, 0, sizeof(host));
+        if (gethostname(host, HOSTLEN - 1) != 0) strcpy(host, "unknown");
+
+        if (0 == rank) {
+            all_hosts = malloc((size_t) world_size * HOSTLEN);
+            all_info = malloc((size_t) world_size * 3 * sizeof(int));
+            if (NULL == all_hosts || NULL == all_info) abort_app("malloc");
+        }
+        MPI_Gather(host, HOSTLEN, MPI_CHAR, all_hosts, HOSTLEN, MPI_CHAR, 0, MPI_COMM_WORLD);
+        MPI_Gather(info, 3, MPI_INT, all_info, 3, MPI_INT, 0, MPI_COMM_WORLD);
+
+        if (0 == rank) {
+            int unset = 0;
+            for (i = 0 ; i < world_size ; ++i) {
+                int lr = all_info[3 * i];
+                if (lr < 0) {
+                    ++unset;
+                    printf("gpu map:    rank %d host %s LOCAL_RANK unset device %d of %d\n",
+                           i, all_hosts + (size_t) i * HOSTLEN,
+                           all_info[3 * i + 1], all_info[3 * i + 2]);
+                } else {
+                    printf("gpu map:    rank %d host %s LOCAL_RANK %d device %d of %d\n",
+                           i, all_hosts + (size_t) i * HOSTLEN, lr,
+                           all_info[3 * i + 1], all_info[3 * i + 2]);
+                }
+            }
+            if (unset > 0) {
+                fprintf(stderr, "Warning: LOCAL_RANK unset on %d of %d ranks; "
+                        "those ranks defaulted to device 0\n", unset, world_size);
+            }
+            free(all_hosts);
+            free(all_info);
+        }
+    }
+#endif
+
+    size_t buffer_size = (size_t) npeers * (size_t) nmsgs * nbytes;
 
     /* allocate buffers */
     send_peers = malloc(sizeof(int) * npeers);
@@ -638,7 +808,7 @@ main(int argc, char *argv[])
     recv_peers = malloc(sizeof(int) * npeers);
     if (NULL == recv_peers) abort_app("malloc");
     cache_buf = malloc(sizeof(int) * cache_size);
-    if (NULL == cache_buf) abort_app("malloc");
+    if (NULL == cache_buf && cache_size > 0) abort_app("malloc");
     /* Call the functions so we can determine where to allocate.*/
     send_buf = (char*) bench_alloc(buffer_size);
     recv_buf = (char*) bench_alloc(buffer_size);
@@ -678,14 +848,60 @@ main(int argc, char *argv[])
     /* sync, although tests will do this on their own (in theory) */
     MPI_Barrier(MPI_COMM_WORLD);
 
-    /* run tests */
+    /*
+     * run tests.  With -v, each test is checked independently: before it,
+     * the send buffer is filled with the expected pattern and the recv
+     * buffer with its complement; after it, every received byte is checked.
+     * All of this happens outside the timed regions.
+     */
+    if (verify) {
+        /* single direction: lower half sends to rank + N/2 using slot 0 */
+        int half = world_size / 2;
+        int in_test = !(world_size % 2 == 1 && rank == world_size - 1);
+        if (in_test && rank < half) {
+            init_send_buffer_one_way(send_buf, rank, rank + half, nmsgs, nbytes);
+        } else if (in_test) {
+            int src = rank - half;
+            poison_recv_buffer(recv_buf, rank, &src, 1, nmsgs, nbytes);
+        }
+    }
     test_one_way();
+    if (verify) {
+        int half = world_size / 2;
+        int in_test = !(world_size % 2 == 1 && rank == world_size - 1);
+        if (in_test && rank >= half) {
+            int src = rank - half;
+            verify_recv_buffer("single direction", recv_buf, rank, &src, 1, nmsgs, nbytes);
+        }
+        init_send_buffer(send_buf, rank, send_peers, npeers, nmsgs, nbytes);
+        poison_recv_buffer(recv_buf, rank, recv_peers, npeers, nmsgs, nbytes);
+    }
+
     test_same_direction();
+    if (verify) {
+        verify_recv_buffer("pair-based", recv_buf, rank, recv_peers, npeers, nmsgs, nbytes);
+        poison_recv_buffer(recv_buf, rank, recv_peers, npeers, nmsgs, nbytes);
+    }
+
     test_prepost();
+    if (verify) {
+        verify_recv_buffer("pre-post", recv_buf, rank, recv_peers, npeers, nmsgs, nbytes);
+        poison_recv_buffer(recv_buf, rank, recv_peers, npeers, nmsgs, nbytes);
+    }
+
     test_allstart();
+    if (verify) {
+        verify_recv_buffer("all-start", recv_buf, rank, recv_peers, npeers, nmsgs, nbytes);
+    }
 
     if (rank == 0 && machine_output) printf("\n");
-    
+
+    if (verify) {
+        /* any mismatch has already called MPI_Abort; reaching here means all ranks passed */
+        MPI_Barrier(MPI_COMM_WORLD);
+        if (rank == 0) printf("verification: PASSED\n");
+    }
+
     // Clean-up
     free(send_peers);
     free(recv_peers);

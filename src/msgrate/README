@@ -24,9 +24,65 @@ execution instructions are also included.
     -i <num>     Number of iterations per test
     -m <num>     Number of messages per peer per iteration
     -s <size>    Number of bytes per message
-    -c <size>    Cache size in bytes
+    -c <size>    Cache size in bytes (0 disables cache invalidation)
     -n <ppn>     Number of procs per node
     -o           Format output to be machine readable
+    -v           Verify message contents; prints "verification: PASSED"
+                 on success, aborts with details on mismatch (see below)
+    --debug      GPU builds only: print one "gpu map:" line per rank
+                 (host, LOCAL_RANK, device) and warn if LOCAL_RANK unset
+
+* GPU Builds (CUDA / HIP):
+
+  msgrate can place its send and receive buffers in GPU memory:
+
+    make CUDA=1 [CUDA_HOME=<cuda install>]
+    make HIP=1  [ROCM_HOME=<rocm install>]
+
+  Enable only one.  If CUDA_HOME / ROCM_HOME are not given, they are
+  taken from $CUDA_PATH / $ROCM_PATH, or found via nvcc / hipconfig on
+  PATH.  The MPI library must be GPU-aware, since device pointers are
+  passed directly to MPI_Isend / MPI_Irecv.
+
+  Each rank selects device (LOCAL_RANK mod device count).  Make sure the
+  launcher sets LOCAL_RANK (for example, from OMPI_COMM_WORLD_LOCAL_RANK
+  or SLURM_LOCALID); if it is unset, every rank uses device 0.
+
+  GPU builds add these lines to the (non -o) header:
+
+    backend:    CUDA            (or HIP)
+    gpu device: <dev> of <count> (rank 0, LOCAL_RANK mod devices)
+
+  Cache invalidation (see Goals) runs in GPU builds too: buffers live on
+  the GPU, but MPI's host-side state should still start cold, matching
+  the CPU build.  Earlier GPU builds skipped it, so their results are
+  not directly comparable.  Use -c 0 to disable it.
+
+* Verification (-v):
+
+  Each of the four tests is verified independently, outside the timed
+  regions.  Before a test, the send buffer is filled with a known
+  pattern and the receive buffer with the bitwise complement of the
+  expected data; after the test, every received byte is checked.  A
+  byte that is not delivered, delivered from the wrong peer, delivered
+  to the wrong slot, or delivered out of message order fails.
+
+  The pattern for byte b of message k sent from rank src to rank dst is
+  derived from (src, dst, k, b).  This extends the report's
+  P(r, k, b) with the destination rank, so a sender that puts one
+  peer's data in another peer's slot is also caught.
+
+  On mismatch, the benchmark prints the test name, rank, receive slot,
+  message index, byte index, observed and expected values, and source
+  rank, then calls MPI_Abort.  "verification: PASSED" is printed only
+  if all four tests pass on all ranks.  With -o, it is printed on its
+  own line after the machine-readable line.
+
+  Limitation: the check sees the data each test leaves in the receive
+  buffer, i.e. the final iteration.  Every iteration sends the same
+  data, but a bug confined to non-final iterations (for example, in
+  pre-post's in-loop send phase, which differs from its final send
+  phase) would not be detected.
 
 * Goals:
 

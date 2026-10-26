@@ -29,8 +29,12 @@ LDLIBS =
 
 # Optional toggles:
 #   make
-#   make CUDA=1
-#   make HIP=1
+#   make CUDA=1 [CUDA_HOME=<cuda install>]
+#   make HIP=1  [ROCM_HOME=<rocm install>]
+#
+# If CUDA_HOME / ROCM_HOME are not given they are derived from the
+# environment: CUDA_HOME from $CUDA_PATH or the location of nvcc on PATH;
+# ROCM_HOME from $ROCM_PATH or `hipconfig --path`.
 
 CUDA ?= 0
 HIP  ?= 0
@@ -45,18 +49,30 @@ endif
 # CUDA build options
 ifeq ($(CUDA),1)
 CPPFLAGS += -DENABLE_CUDA
-CUDA_HOME ?= /usr/local/cuda
+CUDA_HOME ?= $(CUDA_PATH)
+ifeq ($(strip $(CUDA_HOME)),)
+CUDA_HOME := $(patsubst %/bin/nvcc,%,$(shell command -v nvcc 2>/dev/null))
+endif
+ifeq ($(strip $(CUDA_HOME)),)
+$(error CUDA=1 but CUDA install not found: set CUDA_HOME=<path> or CUDA_PATH, or put nvcc on PATH)
+endif
 CPPFLAGS += -I$(CUDA_HOME)/include
-LDFLAGS  += -L$(CUDA_HOME)/lib64
+LDFLAGS  += -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib
 LDLIBS   += -lcudart
 endif
 
 # HIP build options
 ifeq ($(HIP),1)
-CPPFLAGS += -DENABLE_HIP
-ROCM_HOME ?= /opt/rocm
+CPPFLAGS += -DENABLE_HIP -D__HIP_PLATFORM_AMD__
+ROCM_HOME ?= $(ROCM_PATH)
+ifeq ($(strip $(ROCM_HOME)),)
+ROCM_HOME := $(shell hipconfig --path 2>/dev/null)
+endif
+ifeq ($(strip $(ROCM_HOME)),)
+$(error HIP=1 but ROCm install not found: set ROCM_HOME=<path> or ROCM_PATH, or put hipconfig on PATH)
+endif
 CPPFLAGS += -I$(ROCM_HOME)/include
-LDFLAGS  += -L$(ROCM_HOME)/lib64
+LDFLAGS  += -L$(ROCM_HOME)/lib -L$(ROCM_HOME)/lib64
 LDLIBS   += -lamdhip64
 endif
 
